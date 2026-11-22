@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Видеозвонок 1 на 1 (WebRTC)</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee;display:flex;flex-direction:column;min-height:100vh}
+  header{padding:12px 16px;display:flex;justify-content:space-between;align-items:center;background:#1b1b1b}
+  #status{font-size:14px;color:#9ad}
+  main{flex:1;position:relative;display:flex;align-items:center;justify-content:center;padding:12px}
+  #remote{width:100%;max-width:960px;max-height:75vh;background:#000;border-radius:12px}
+  #local{position:absolute;right:24px;bottom:24px;width:200px;max-width:30vw;border-radius:8px;border:2px solid #444;background:#000;transform:scaleX(-1)}
+  footer{padding:12px;display:flex;gap:10px;justify-content:center;background:#1b1b1b}
+  button{padding:10px 18px;border:0;border-radius:8px;font-size:15px;cursor:pointer;background:#333;color:#fff}
+  button:hover{background:#444}
+  button.off{background:#a33}
+  #hangup{background:#c0392b}
+</style>
+</head>
+<body>
+<header><strong>WebRTC звонок 1 на 1</strong><span id="status">Запуск…</span></header>
+<main>
+  <video id="remote" autoplay playsinline></video>
+  <video id="local" autoplay playsinline muted></video>
+</main>
+<footer>
+  <button id="mic">🎤 Микрофон</button>
+  <button id="cam">📷 Камера</button>
+  <button id="hangup">Выйти</button>
+</footer>
+<script>
+const SIGNALING_URL = 'wss://inai-col3.fishrungames.com/signaling/';
+const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status'), localV = $('local'), remoteV = $('remote');
+const setStatus = t => statusEl.textContent = t;
+
+let ws, pc, localStream, pendingCandidates = [], closedByUser = false;
+
+const send = obj => ws && ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(obj));
+
+async function start() {
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  } catch (e) {
+    setStatus('Нет доступа к камере/микрофону: ' + e.message);
+    return;
+  }
+  localV.srcObject = localStream;
+  connectWS();
+}
+
+function connectWS() {
+  ws = new WebSocket(SIGNALING_URL);
+  ws.onopen = () => {
+    setStatus('Ожидание собеседника… (откройте эту страницу во втором окне)');
+    send({ type: 'ready' });
+  };
+  ws.onmessage = async ev => {
+    let text = typeof ev.data === 'string' ? ev.data : await ev.data.text();
+    let msg;
+    try { msg = JSON.parse(text); } catch { return; }
+    try { await onSignal(msg); } catch (e) { console.error(e); setStatus('Ошибка: ' + e.message); }
+  };
+  ws.onclose = () => {
+    if (closedByUser) return;
+    setStatus('Соединение с сервером потеряно (возможно, подключился третий участник)');
+    closePeer();
+  };
+  ws.onerror = () => setStatus('Ошибка WebSocket');
+}
+
+function createPeer() {
+  closePeer();
+  pc = new RTCPeerConnection(RTC_CONFIG);
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  pc.onicecandidate = e => e.candidate && send({ type: 'candidate', candidate: e.candidate });
+  pc.ontrack = e => { remoteV.srcObject = e.streams[0]; };
+  pc.onconnectionstatechange = () => {
+    const s = pc.connectionState;
+    if (s === 'connected') setStatus('Соединено ✅');
+    else if (s === 'connecting') setStatus('Соединение…');
+    else if (s === 'failed') setStatus('Не удалось соединиться ❌');
+  };
+  return pc;
+}
+
+function closePeer() {
+  if (pc) { pc.close(); pc = null; }
+  pendingCandidates = [];
+  remoteV.srcObject = null;
+}
+
+async function flushCandidates() {
+  for (const c of pendingCandidates) await pc.addIceCandidate(c).catch(console.error);
+  pendingCandidates = [];
+}
+
+async function onSignal(msg) {
+  switch (msg.type) {
+    case 'ready': {
+      // Пришёл второй участник — мы (кто был первым) создаём offer.
+      createPeer();
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      send({ type: 'offer', sdp: pc.localDescription });
+      setStatus('Звоним…');
+      break;
+    }
+    case 'offer': {
+      createPeer();
+      await pc.setRemoteDescription(msg.sdp);
+      await flushCandidates();
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      send({ type: 'answer', sdp: pc.localDescription });
+      break;
+    }
+    case 'answer':
+      if (!pc) return;
+      await pc.setRemoteDescription(msg.sdp);
+      await flushCandidates();
+      break;
+    case 'candidate':
+      if (!pc) return;
+      if (pc.remoteDescription) await pc.addIceCandidate(msg.candidate).catch(console.error);
+      else pendingCandidates.push(msg.candidate);
+      break;
+    case 'peer-left':
+      closePeer();
+      setStatus('Собеседник вышел. Ожидание нового…');
+      send({ type: 'ready' });
+      break;
+  }
+}
+
+function toggle(kind, btn, label) {
+  const tracks = kind === 'audio' ? localStream.getAudioTracks() : localStream.getVideoTracks();
+  const enable = !tracks[0]?.enabled;
+  tracks.forEach(t => t.enabled = enable);
+  btn.classList.toggle('off', !enable);
+  btn.textContent = (enable ? '' : '🚫 ') + label;
+}
+$('mic').onclick = () => toggle('audio', $('mic'), '🎤 Микрофон');
+$('cam').onclick = () => toggle('video', $('cam'), '📷 Камера');
+$('hangup').onclick = () => {
+  closedByUser = true;
+  closePeer();
+  ws && ws.close();
+  localStream && localStream.getTracks().forEach(t => t.stop());
+  setStatus('Вы вышли. Обновите страницу, чтобы позвонить снова.');
+};
+
+start();
+</script>
+</body>
+</html>
